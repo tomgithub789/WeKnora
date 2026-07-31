@@ -1,0 +1,38 @@
+services:
+  frontend:
+    ports: !override
+      - "127.0.0.1:80:80"
+
+  app:
+    env_file: !override []
+    ports: !override
+      - "127.0.0.1:8080:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  redis:
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", 'redis-cli -a "$${REDIS_PASSWORD}" ping | grep -q PONG']
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+networks:
+  WeKnora-network:
+    name: weknora070_network
+
+volumes:
+  postgres-data:
+    name: weknora070_postgres_data
+  data-files:
+    name: weknora070_app_data
+  docreader-tmp:
+    name: weknora070_docreader_tmp
+  redis-data:
+    name: weknora070_redis_data
