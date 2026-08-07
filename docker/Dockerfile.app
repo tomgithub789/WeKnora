@@ -36,6 +36,7 @@ ARG VERSION_ARG
 ARG COMMIT_ID_ARG
 ARG BUILD_TIME_ARG
 ARG GO_VERSION_ARG
+ARG GO_BUILD_TAGS_ARG
 
 # Set build-time variables
 ENV VERSION=${VERSION_ARG}
@@ -44,7 +45,7 @@ ENV BUILD_TIME=${BUILD_TIME_ARG}
 ENV GO_VERSION=${GO_VERSION_ARG}
 
 # Build the application with version info
-RUN --mount=type=cache,target=/go/pkg/mod make build-prod
+RUN --mount=type=cache,target=/go/pkg/mod make build-prod GO_BUILD_TAGS="${GO_BUILD_TAGS_ARG}"
 RUN --mount=type=cache,target=/go/pkg/mod cp -r /go/pkg/mod/github.com/yanyiwu/ /app/yanyiwu/
 
 # Final stage

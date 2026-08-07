@@ -17,6 +17,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/searchutil"
+	structuredoutput "github.com/Tencent/WeKnora/internal/structuredoutput"
 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
@@ -2375,6 +2376,18 @@ func (s *wikiIngestService) deduplicateExtractedBatch(
 		logger.Warnf(ctx, "wiki ingest: deduplication LLM call failed: %v", err)
 		return entities, concepts
 	}
+	if structuredoutput.Enabled() {
+		accepted, acceptErr := structuredoutput.Accept(ctx, structuredoutput.Request{
+			Contract: structuredoutput.ContractWikiDedup,
+			Raw:      dedupeJSON,
+			ModelID:  chatModel.GetModelID(),
+		})
+		if acceptErr != nil {
+			logger.Warnf(ctx, "wiki ingest: deduplication structured output rejected: %v", acceptErr)
+			return entities, concepts
+		}
+		dedupeJSON = accepted.JSON
+	}
 
 	dedupeJSON = cleanLLMJSON(dedupeJSON)
 
@@ -2382,7 +2395,11 @@ func (s *wikiIngestService) deduplicateExtractedBatch(
 		Merges map[string]string `json:"merges"`
 	}
 	if err := json.Unmarshal([]byte(dedupeJSON), &dedupeResult); err != nil {
-		logger.Warnf(ctx, "wiki ingest: failed to parse dedup JSON: %v\nRaw: %s", err, dedupeJSON)
+		if structuredoutput.CurrentMode() == structuredoutput.ModeEnforce {
+			logger.Warnf(ctx, "wiki ingest: failed to parse accepted dedup JSON: %v", err)
+		} else {
+			logger.Warnf(ctx, "wiki ingest: failed to parse dedup JSON: %v\nRaw: %s", err, dedupeJSON)
+		}
 		return entities, concepts
 	}
 
@@ -2501,9 +2518,21 @@ func (s *wikiIngestService) generateWithTemplate(ctx context.Context, chatModel 
 
 		var lastErr error
 		for attempt := 1; attempt <= wikiLLMMaxAttempts; attempt++ {
-			response, callErr := chatModel.Chat(ctx, messages, opts)
+			callCtx, cancel := structuredoutput.WithCallTimeout(ctx)
+			response, callErr := chatModel.Chat(callCtx, messages, opts)
+			cancel()
 			if callErr == nil && response != nil {
-				return response.Content, nil
+				if structuredoutput.Enabled() {
+					callErr = structuredoutput.ValidateResponse(ctx, structuredoutput.Response{
+						Contract:     wikiStructuredOutputContract(promptTpl),
+						Content:      response.Content,
+						FinishReason: response.FinishReason,
+						ModelID:      chatModel.GetModelID(),
+					})
+				}
+				if callErr == nil {
+					return response.Content, nil
+				}
 			}
 			if callErr == nil {
 				callErr = errors.New("LLM returned nil response")
@@ -2579,6 +2608,21 @@ func wikiPromptPurpose(promptTpl string) string {
 	}
 }
 
+func wikiStructuredOutputContract(promptTpl string) structuredoutput.Contract {
+	switch promptTpl {
+	case agent.WikiCandidateSlugPrompt, agent.WikiKnowledgeExtractPrompt:
+		return structuredoutput.ContractWikiCombined
+	case agent.WikiChunkCitationPrompt:
+		return structuredoutput.ContractWikiCitation
+	case agent.WikiDeduplicationPrompt:
+		return structuredoutput.ContractWikiDedup
+	case agent.WikiTaxonomyPlanPrompt:
+		return structuredoutput.ContractWikiTaxonomy
+	default:
+		return structuredoutput.Contract("wiki." + wikiPromptPurpose(promptTpl))
+	}
+}
+
 func (s *wikiIngestService) awaitWikiPromptWarmup(ctx context.Context, key string) (func(), error) {
 	if key == "" {
 		return func() {}, nil
@@ -2627,6 +2671,15 @@ func isTransientLLMError(ctx context.Context, err error) bool {
 	// being cancelled and the next attempt would just fail again.
 	if ctx.Err() != nil {
 		return false
+	}
+	var contractErr *structuredoutput.ContractError
+	if errors.As(err, &contractErr) {
+		switch contractErr.Code {
+		case structuredoutput.ErrorEmptyContent, structuredoutput.ErrorJSONTruncated:
+			return true
+		default:
+			return false
+		}
 	}
 
 	msg := err.Error()

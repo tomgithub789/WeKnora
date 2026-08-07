@@ -31,6 +31,7 @@ services:
       dockerfile: docker/Dockerfile.app
       args:
         - APK_MIRROR_ARG=${APK_MIRROR_ARG:-}
+        - GO_BUILD_TAGS_ARG=${WEKNORA_GO_BUILD_TAGS:-}
     container_name: WeKnora-app
     ports:
       - "${APP_PORT:-8080}:8080"
@@ -81,6 +82,13 @@ services:
       # 文档处理语言（问题/摘要生成）。优先级：此环境变量（部署级覆盖，非空即生效）
       # > Accept-Language 请求头 > 内置默认值 (zh-CN)。留空则跟随请求方 Accept-Language。
       - WEKNORA_LANGUAGE=${WEKNORA_LANGUAGE:-}
+      # 可选结构化输出接收扩展；镜像还必须用 weknora_structured_output tag 构建。
+      # off 完全走源码链路；shadow 只审计；enforce 才使用验收结果。
+      - WEKNORA_STRUCTURED_OUTPUT_MODE=${WEKNORA_STRUCTURED_OUTPUT_MODE:-off}
+      - WEKNORA_STRUCTURED_OUTPUT_ACCEPTANCE=${WEKNORA_STRUCTURED_OUTPUT_ACCEPTANCE:-strict}
+      - WEKNORA_STRUCTURED_OUTPUT_GENERATION_OWNER=${WEKNORA_STRUCTURED_OUTPUT_GENERATION_OWNER:-none}
+      - WEKNORA_STRUCTURED_OUTPUT_MODEL_RULES=${WEKNORA_STRUCTURED_OUTPUT_MODEL_RULES:-}
+      - WEKNORA_STRUCTURED_OUTPUT_LLM_TIMEOUT_SECONDS=${WEKNORA_STRUCTURED_OUTPUT_LLM_TIMEOUT_SECONDS:-300}
       # gin 信任的代理 CIDR（逗号分隔）；显式设为空字符串则禁用代理信任。
       # 默认信任 loopback + 私网段（容器网络内 nginx 已覆盖）
       # - WEKNORA_TRUSTED_PROXIES=${WEKNORA_TRUSTED_PROXIES:-}
@@ -537,7 +545,12 @@ services:
   searxng-init:
     image: busybox:1.36
     container_name: WeKnora-searxng-init
-    command: ["sh", "-c", "cp /template/settings.yml /etc/searxng/settings.yml && chmod 0644 /etc/searxng/settings.yml"]
+    command:
+      [
+        "sh",
+        "-c",
+        "cp /template/settings.yml /etc/searxng/settings.yml && chmod 0644 /etc/searxng/settings.yml",
+      ]
     volumes:
       - ./docker/searxng/settings.yml:/template/settings.yml:ro
       - searxng_config:/etc/searxng
@@ -867,8 +880,8 @@ services:
     image: langfuse/langfuse-worker:3
     container_name: WeKnora-langfuse-worker
     restart: unless-stopped
-    depends_on: &langfuse-depends-on
-      # 复用 WeKnora 已有的 postgres/redis，需要先完成 langfuse 数据库的创建
+    depends_on:
+      &langfuse-depends-on # 复用 WeKnora 已有的 postgres/redis，需要先完成 langfuse 数据库的创建
       langfuse-db-init:
         condition: service_completed_successfully
       redis:
@@ -893,8 +906,8 @@ services:
         export REDIS_CONNECTION_STRING="redis://:$$RP@redis:6379/$$_LF_REDIS_DB"
         unset _LF_DB_USER _LF_DB_PASSWORD _LF_REDIS_PASSWORD
         exec dumb-init -- ./worker/entrypoint.sh node worker/dist/index.js
-    environment: &langfuse-env
-      # 原始凭证（未 URL 编码），由 entrypoint wrapper 读取并组装成 DATABASE_URL / REDIS_CONNECTION_STRING
+    environment:
+      &langfuse-env # 原始凭证（未 URL 编码），由 entrypoint wrapper 读取并组装成 DATABASE_URL / REDIS_CONNECTION_STRING
       _LF_DB_USER: ${DB_USER}
       _LF_DB_PASSWORD: ${DB_PASSWORD}
       _LF_DB_NAME: ${LANGFUSE_DB_NAME:-langfuse}

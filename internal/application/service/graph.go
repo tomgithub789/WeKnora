@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"slices"
@@ -16,6 +17,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/models/chat"
 	"github.com/Tencent/WeKnora/internal/models/utils"
 	"github.com/Tencent/WeKnora/internal/searchutil"
+	structuredoutput "github.com/Tencent/WeKnora/internal/structuredoutput"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/google/uuid"
 	"golang.org/x/sync/errgroup"
@@ -120,19 +122,51 @@ func (b *graphBuilder) extractEntities(ctx context.Context, chunk *types.Chunk) 
 
 	// Call LLM to extract entities
 	log.Debug("Calling LLM to extract entities")
-	resp, err := b.chatModel.Chat(ctx, messages, &chat.ChatOptions{
+	callCtx, cancel := structuredoutput.WithCallTimeout(ctx)
+	resp, err := b.chatModel.Chat(callCtx, messages, &chat.ChatOptions{
 		Temperature: DefaultLLMTemperature,
 		Thinking:    &thinking,
 	})
+	cancel()
 	if err != nil {
 		log.WithError(err).Error("Failed to extract entities from chunk")
 		return nil, fmt.Errorf("LLM entity extraction failed: %w", err)
 	}
+	if resp == nil && structuredoutput.CurrentMode() == structuredoutput.ModeEnforce {
+		return nil, &structuredoutput.ContractError{
+			Code: structuredoutput.ErrorEmptyContent, Contract: structuredoutput.ContractGraphLegacyEntities,
+			Err: errors.New("model returned nil response"),
+		}
+	}
+	responseContent := resp.Content
+	if structuredoutput.Enabled() {
+		if err := structuredoutput.ValidateResponse(ctx, structuredoutput.Response{
+			Contract:     structuredoutput.ContractGraphLegacyEntities,
+			Content:      responseContent,
+			FinishReason: resp.FinishReason,
+			ModelID:      b.chatModel.GetModelID(),
+		}); err != nil {
+			return nil, err
+		}
+		accepted, err := structuredoutput.Accept(ctx, structuredoutput.Request{
+			Contract: structuredoutput.ContractGraphLegacyEntities,
+			Raw:      responseContent,
+			ModelID:  b.chatModel.GetModelID(),
+		})
+		if err != nil {
+			return nil, err
+		}
+		responseContent = accepted.JSON
+	}
 
 	// Parse JSON response
 	var extractedEntities []*types.Entity
-	if err := common.ParseLLMJsonResponse(resp.Content, &extractedEntities); err != nil {
-		log.WithError(err).Errorf("Failed to parse entity extraction response, rsp content: %s", resp.Content)
+	if err := common.ParseLLMJsonResponse(responseContent, &extractedEntities); err != nil {
+		if structuredoutput.CurrentMode() == structuredoutput.ModeEnforce {
+			log.WithError(err).Error("Failed to parse accepted entity extraction response")
+		} else {
+			log.WithError(err).Errorf("Failed to parse entity extraction response, rsp content: %s", responseContent)
+		}
 		return nil, fmt.Errorf("failed to parse entity extraction response: %w", err)
 	}
 	log.Infof("Extracted %d entities from chunk", len(extractedEntities))
@@ -231,18 +265,46 @@ func (b *graphBuilder) extractRelationships(ctx context.Context,
 
 	// Call LLM to extract relationships
 	log.Debug("Calling LLM to extract relationships")
-	resp, err := b.chatModel.Chat(ctx, messages, &chat.ChatOptions{
+	callCtx, cancel := structuredoutput.WithCallTimeout(ctx)
+	resp, err := b.chatModel.Chat(callCtx, messages, &chat.ChatOptions{
 		Temperature: DefaultLLMTemperature,
 		Thinking:    &thinking,
 	})
+	cancel()
 	if err != nil {
 		log.WithError(err).Error("Failed to extract relationships")
 		return fmt.Errorf("LLM relationship extraction failed: %w", err)
 	}
+	if resp == nil && structuredoutput.CurrentMode() == structuredoutput.ModeEnforce {
+		return &structuredoutput.ContractError{
+			Code: structuredoutput.ErrorEmptyContent, Contract: structuredoutput.ContractGraphLegacyRelations,
+			Err: errors.New("model returned nil response"),
+		}
+	}
+	responseContent := resp.Content
+	if structuredoutput.Enabled() {
+		if err := structuredoutput.ValidateResponse(ctx, structuredoutput.Response{
+			Contract:     structuredoutput.ContractGraphLegacyRelations,
+			Content:      responseContent,
+			FinishReason: resp.FinishReason,
+			ModelID:      b.chatModel.GetModelID(),
+		}); err != nil {
+			return err
+		}
+		accepted, err := structuredoutput.Accept(ctx, structuredoutput.Request{
+			Contract: structuredoutput.ContractGraphLegacyRelations,
+			Raw:      responseContent,
+			ModelID:  b.chatModel.GetModelID(),
+		})
+		if err != nil {
+			return err
+		}
+		responseContent = accepted.JSON
+	}
 
 	// Parse JSON response
 	var extractedRelationships []*types.Relationship
-	if err := common.ParseLLMJsonResponse(resp.Content, &extractedRelationships); err != nil {
+	if err := common.ParseLLMJsonResponse(responseContent, &extractedRelationships); err != nil {
 		log.WithError(err).Error("Failed to parse relationship extraction response")
 		return fmt.Errorf("failed to parse relationship extraction response: %w", err)
 	}

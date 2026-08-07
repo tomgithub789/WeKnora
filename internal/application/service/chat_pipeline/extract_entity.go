@@ -12,6 +12,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/config"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
+	structuredoutput "github.com/Tencent/WeKnora/internal/structuredoutput"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/Tencent/WeKnora/internal/types/interfaces"
 )
@@ -185,13 +186,42 @@ func (e *Extractor) Extract(ctx context.Context, content string) (*types.GraphDa
 	// logger.Debugf(ctx, "chat user: %s", generator.User(ctx, content))
 
 	modelCtx := types.WithLLMCallMetadata(ctx, "entity_extraction", "")
-	chatResponse, err := e.chat.Chat(modelCtx, generator.Render(ctx, content), e.chatOpt)
+	callCtx, cancel := structuredoutput.WithCallTimeout(modelCtx)
+	chatResponse, err := e.chat.Chat(callCtx, generator.Render(ctx, content), e.chatOpt)
+	cancel()
 	if err != nil {
 		logger.Errorf(ctx, "failed to chat: %v", err)
 		return nil, err
 	}
+	if chatResponse == nil && structuredoutput.CurrentMode() == structuredoutput.ModeEnforce {
+		return nil, &structuredoutput.ContractError{
+			Code: structuredoutput.ErrorEmptyContent, Contract: structuredoutput.ContractGraphDocument,
+			Err: errors.New("model returned nil response"),
+		}
+	}
 
-	graph, err := e.formater.ParseGraph(ctx, chatResponse.Content)
+	responseContent := chatResponse.Content
+	if structuredoutput.Enabled() {
+		if err := structuredoutput.ValidateResponse(ctx, structuredoutput.Response{
+			Contract:     structuredoutput.ContractGraphDocument,
+			Content:      responseContent,
+			FinishReason: chatResponse.FinishReason,
+			ModelID:      e.chat.GetModelID(),
+		}); err != nil {
+			return nil, err
+		}
+		accepted, err := structuredoutput.Accept(ctx, structuredoutput.Request{
+			Contract: structuredoutput.ContractGraphDocument,
+			Raw:      responseContent,
+			ModelID:  e.chat.GetModelID(),
+		})
+		if err != nil {
+			return nil, err
+		}
+		responseContent = accepted.JSON
+	}
+
+	graph, err := e.formater.ParseGraph(ctx, responseContent)
 	if err != nil {
 		logger.Errorf(ctx, "failed to parse graph: %v", err)
 		return nil, err
