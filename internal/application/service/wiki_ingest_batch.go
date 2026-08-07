@@ -15,6 +15,7 @@ import (
 	apprepo "github.com/Tencent/WeKnora/internal/application/repository"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
+	structuredoutput "github.com/Tencent/WeKnora/internal/structuredoutput"
 	"github.com/Tencent/WeKnora/internal/tracing/langfuse"
 	"github.com/Tencent/WeKnora/internal/types"
 	"github.com/google/uuid"
@@ -1249,6 +1250,13 @@ func (s *wikiIngestService) mapOneDocument(
 	})
 	extractedEntities, extractedConcepts, slugItems, err = s.extractCandidateSlugs(ctx, chatModel, payload.KnowledgeBaseID, content, lang, oldPageSlugs, batchCtx)
 	if err != nil {
+		var contractErr *structuredoutput.ContractError
+		if structuredoutput.CurrentMode() == structuredoutput.ModeEnforce && errors.As(err, &contractErr) {
+			logger.Warnf(ctx, "wiki ingest: pass 0 structured output rejected for %s: %v", knowledgeID, err)
+			s.tracker().FailSpan(ctx, extractSpan, string(contractErr.Code), err.Error(), err)
+			s.tracker().FailSpan(ctx, wikiSpan, string(contractErr.Code), err.Error(), err)
+			return nil, nil, err
+		}
 		logger.Warnf(ctx, "wiki ingest: pass 0 failed for %s (%v) — falling back to legacy extractor", knowledgeID, err)
 		pass0Failed = true
 		extractedEntities, extractedConcepts, slugItems, err = s.extractEntitiesAndConceptsNoUpsert(ctx, chatModel, payload.KnowledgeBaseID, content, lang, oldPageSlugs, batchCtx)
@@ -1300,6 +1308,7 @@ func (s *wikiIngestService) mapOneDocument(
 		citations      map[string][]string
 		newSlugs       []newSlugFromCitation
 		batchCount     int
+		classifyErr    error
 	)
 
 	// Both calls run in parallel goroutines under the same wikiSpan
@@ -1349,16 +1358,28 @@ func (s *wikiIngestService) mapOneDocument(
 			return
 		}
 		candidatesXML := renderCandidateSlugsXML(extractedEntities, extractedConcepts)
-		citations, newSlugs, batchCount = s.classifyChunkCitations(ctx, chatModel, candidatesXML, chunks, lang, batchCtx)
-		s.tracker().EndSpan(ctx, classifySpan, types.JSONMap{
+		citations, newSlugs, batchCount, classifyErr = s.classifyChunkCitations(
+			ctx, chatModel, structuredOutputCandidates(extractedEntities, extractedConcepts),
+			candidatesXML, chunks, lang, batchCtx,
+		)
+		spanData := types.JSONMap{
 			"cited_slugs":      len(citations),
 			"new_slugs":        len(newSlugs),
 			"batches":          batchCount,
 			"top_cited":        topCitedSlugs(citations, 8),
 			"new_slugs_sample": previewNewSlugs(newSlugs, 8),
-		})
+		}
+		if classifyErr != nil {
+			s.tracker().FailSpan(ctx, classifySpan, "CITATION_VALIDATION_FAILED", classifyErr.Error(), classifyErr)
+			return
+		}
+		s.tracker().EndSpan(ctx, classifySpan, spanData)
 	}()
 	wg.Wait()
+	if classifyErr != nil {
+		s.tracker().FailSpan(ctx, wikiSpan, "CITATION_VALIDATION_FAILED", classifyErr.Error(), classifyErr)
+		return nil, nil, fmt.Errorf("classify chunk citations: %w", classifyErr)
+	}
 
 	// Merge citations back into the item structs (non-failing; items without
 	// citations simply keep their Description+Details fallback).
@@ -1629,11 +1650,27 @@ func (s *wikiIngestService) extractEntitiesAndConceptsNoUpsert(
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("combined extraction failed: %w", err)
 	}
+	if structuredoutput.Enabled() {
+		accepted, acceptErr := structuredoutput.Accept(ctx, structuredoutput.Request{
+			Contract: structuredoutput.ContractWikiCombined,
+			Raw:      extractionJSON,
+			ModelID:  chatModel.GetModelID(),
+		})
+		if acceptErr != nil {
+			return nil, nil, nil, fmt.Errorf("validate combined extraction: %w", acceptErr)
+		}
+		extractionJSON = accepted.JSON
+	}
 
 	extractionJSON = cleanLLMJSON(extractionJSON)
 
 	var result combinedExtraction
 	if err := json.Unmarshal([]byte(extractionJSON), &result); err != nil {
+		if structuredoutput.CurrentMode() == structuredoutput.ModeEnforce {
+			return nil, nil, nil, &structuredoutput.ContractError{
+				Code: structuredoutput.ErrorJSONSchema, Contract: structuredoutput.ContractWikiCombined, Err: err,
+			}
+		}
 		logger.Warnf(ctx, "wiki ingest: failed to parse combined extraction JSON: %v\nRaw: %s", err, extractionJSON)
 		return nil, nil, nil, fmt.Errorf("parse combined extraction JSON: %w", err)
 	}

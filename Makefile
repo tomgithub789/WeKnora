@@ -67,6 +67,9 @@ help:
 # Go related variables
 BINARY_NAME=WeKnora
 MAIN_PATH=./cmd/server
+GO_BUILD_TAGS ?=
+GO_BUILD_TAGS_FLAG := $(if $(strip $(GO_BUILD_TAGS)),-tags "$(strip $(GO_BUILD_TAGS))",)
+LITE_GO_BUILD_TAGS := sqlite_fts5 $(strip $(GO_BUILD_TAGS))
 
 # Docker related variables
 DOCKER_IMAGE=wechatopenai/weknora-app
@@ -85,7 +88,7 @@ endif
 
 # Build the application
 build:
-	go build -o $(BINARY_NAME) $(MAIN_PATH)
+	go build $(GO_BUILD_TAGS_FLAG) -o $(BINARY_NAME) $(MAIN_PATH)
 
 # Run the application
 run: build
@@ -110,6 +113,7 @@ docker-build-app:
 		--build-arg COMMIT_ID_ARG="$$COMMIT_ID" \
 		--build-arg BUILD_TIME_ARG="$$BUILD_TIME" \
 		--build-arg GO_VERSION_ARG="$$GO_VERSION" \
+		--build-arg GO_BUILD_TAGS_ARG="$(GO_BUILD_TAGS)" \
 		-f docker/Dockerfile.app -t $(DOCKER_IMAGE):$(DOCKER_TAG) .
 
 # Build docreader Docker image
@@ -243,7 +247,7 @@ build-prod:
 	BUILD_TIME=$${BUILD_TIME:-unknown}; \
 	GO_VERSION=$${GO_VERSION:-unknown}; \
 	LDFLAGS="-X 'github.com/Tencent/WeKnora/internal/handler.Version=$$VERSION' -X 'github.com/Tencent/WeKnora/internal/handler.Edition=standard' -X 'github.com/Tencent/WeKnora/internal/handler.CommitID=$$COMMIT_ID' -X 'github.com/Tencent/WeKnora/internal/handler.BuildTime=$$BUILD_TIME' -X 'github.com/Tencent/WeKnora/internal/handler.GoVersion=$$GO_VERSION' -X 'google.golang.org/protobuf/reflect/protoregistry.conflictPolicy=warn'"; \
-	go build -ldflags="-w -s $$LDFLAGS" -o $(BINARY_NAME) $(MAIN_PATH)
+	go build $(GO_BUILD_TAGS_FLAG) -ldflags="-w -s $$LDFLAGS" -o $(BINARY_NAME) $(MAIN_PATH)
 
 # Build Lite version (single binary, SQLite + in-memory queue)
 # 会先构建前端到 web/，再构建 Go 二进制；SKIP_FRONTEND=1 可跳过前端
@@ -263,7 +267,7 @@ build-lite:
 	CGO_ENABLED=1 \
 	CGO_CFLAGS="-Wno-deprecated-declarations" \
 	CGO_LDFLAGS="$$(if [ "$$(uname)" = 'Darwin' ]; then echo '-Wl,-no_warn_duplicate_libraries'; fi)" \
-	go build -tags "sqlite_fts5" -ldflags="-w -s $$LDFLAGS" -o $(BINARY_NAME)-lite $(MAIN_PATH)
+	go build -tags "$(LITE_GO_BUILD_TAGS)" -ldflags="-w -s $$LDFLAGS" -o $(BINARY_NAME)-lite $(MAIN_PATH)
 
 # Run Lite version with .env.lite defaults
 run-lite: build-lite
@@ -331,5 +335,4 @@ dev-app:
 
 dev-frontend:
 	./scripts/dev.sh frontend
-
 

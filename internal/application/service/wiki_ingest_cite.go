@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/modelcontext"
 	"github.com/Tencent/WeKnora/internal/models/chat"
+	structuredoutput "github.com/Tencent/WeKnora/internal/structuredoutput"
 	"github.com/Tencent/WeKnora/internal/types"
 	"golang.org/x/sync/errgroup"
 )
@@ -105,11 +107,27 @@ func (s *wikiIngestService) extractCandidateSlugs(
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("candidate slug extraction failed: %w", err)
 	}
+	if structuredoutput.Enabled() {
+		accepted, acceptErr := structuredoutput.Accept(ctx, structuredoutput.Request{
+			Contract: structuredoutput.ContractWikiCombined,
+			Raw:      raw,
+			ModelID:  chatModel.GetModelID(),
+		})
+		if acceptErr != nil {
+			return nil, nil, nil, fmt.Errorf("validate candidate slug extraction: %w", acceptErr)
+		}
+		raw = accepted.JSON
+	}
 
 	raw = cleanLLMJSON(raw)
 
 	var result combinedExtraction
 	if err := json.Unmarshal([]byte(raw), &result); err != nil {
+		if structuredoutput.CurrentMode() == structuredoutput.ModeEnforce {
+			return nil, nil, nil, &structuredoutput.ContractError{
+				Code: structuredoutput.ErrorJSONSchema, Contract: structuredoutput.ContractWikiCombined, Err: err,
+			}
+		}
 		logger.Warnf(ctx, "wiki ingest: failed to parse candidate slug JSON: %v\nRaw: %s", err, raw)
 		return nil, nil, nil, fmt.Errorf("parse candidate slug JSON: %w", err)
 	}
@@ -244,26 +262,48 @@ func renderChunksXML(batch chunkBatch) string {
 	return sb.String()
 }
 
+func structuredOutputCandidates(entities, concepts []extractedItem) []structuredoutput.Candidate {
+	candidates := make([]structuredoutput.Candidate, 0, len(entities)+len(concepts))
+	for _, item := range entities {
+		candidates = append(candidates, structuredoutput.Candidate{Slug: item.Slug, Kind: types.WikiPageTypeEntity})
+	}
+	for _, item := range concepts {
+		candidates = append(candidates, structuredoutput.Candidate{Slug: item.Slug, Kind: types.WikiPageTypeConcept})
+	}
+	return candidates
+}
+
+func structuredOutputHandles(batch chunkBatch) []string {
+	handles := make([]string, 0, len(batch.chunks))
+	for _, chunk := range batch.chunks {
+		if handle, ok := batch.handles.Handle(chunk.ID); ok {
+			handles = append(handles, handle)
+		}
+	}
+	return handles
+}
+
 // classifyChunkCitations runs Pass 1..N of the chunk-cited pipeline: given a
 // set of candidate slugs (from Pass 0) and the document's chunks, it asks the
 // LLM which chunks substantively discuss each candidate. Results across
 // batches are merged into a single slug → union(chunk_id) map, and any
 // "new_slugs" that Pass 0 missed are collected separately.
 //
-// Returns (citations, newSlugs, batchCount). citations is keyed by slug and
+// Returns (citations, newSlugs, batchCount, error). citations is keyed by slug and
 // contains real chunk UUIDs (already translated from batch handles). newSlugs
 // likewise carry real chunk UUIDs in SourceChunks.
 func (s *wikiIngestService) classifyChunkCitations(
 	ctx context.Context,
 	chatModel chat.Chat,
+	candidates []structuredoutput.Candidate,
 	candidatesXML string,
 	chunks []*types.Chunk,
 	lang string,
 	batchCtx *WikiBatchContext,
-) (map[string][]string, []newSlugFromCitation, int) {
+) (map[string][]string, []newSlugFromCitation, int, error) {
 	batches := splitChunksIntoCitationBatches(chunks)
 	if len(batches) == 0 || strings.TrimSpace(candidatesXML) == "" {
-		return map[string][]string{}, nil, 0
+		return map[string][]string{}, nil, 0, nil
 	}
 
 	// Merge state. Using sets keyed by (slug, chunkID) to dedup across
@@ -287,12 +327,34 @@ func (s *wikiIngestService) classifyChunkCitations(
 			})
 			if err != nil {
 				logger.Warnf(ectx, "wiki ingest: citation batch %d failed: %v", batchIdx, err)
+				var contractErr *structuredoutput.ContractError
+				if structuredoutput.CurrentMode() == structuredoutput.ModeEnforce && errors.As(err, &contractErr) {
+					return err
+				}
 				return nil // don't abort peer batches
+			}
+			if structuredoutput.Enabled() {
+				accepted, acceptErr := structuredoutput.Accept(ectx, structuredoutput.Request{
+					Contract:   structuredoutput.ContractWikiCitation,
+					Raw:        raw,
+					ModelID:    chatModel.GetModelID(),
+					Candidates: candidates,
+					Handles:    structuredOutputHandles(batch),
+				})
+				if acceptErr != nil {
+					return fmt.Errorf("validate citation batch %d: %w", batchIdx, acceptErr)
+				}
+				raw = accepted.JSON
 			}
 			raw = cleanLLMJSON(raw)
 
 			var parsed citationBatchResult
 			if jerr := json.Unmarshal([]byte(raw), &parsed); jerr != nil {
+				if structuredoutput.CurrentMode() == structuredoutput.ModeEnforce {
+					return &structuredoutput.ContractError{
+						Code: structuredoutput.ErrorJSONSchema, Contract: structuredoutput.ContractWikiCitation, Err: jerr,
+					}
+				}
 				logger.Warnf(ectx, "wiki ingest: citation batch %d parse failed: %v\nRaw: %s", batchIdx, jerr, raw)
 				return nil
 			}
@@ -336,7 +398,9 @@ func (s *wikiIngestService) classifyChunkCitations(
 			return nil
 		})
 	}
-	_ = eg.Wait()
+	if err := eg.Wait(); err != nil {
+		return nil, nil, len(batches), err
+	}
 
 	// Build a stable chunk-order so the final citations come out in document order.
 	chunkOrder := make(map[string]int, len(chunks))
@@ -356,7 +420,7 @@ func (s *wikiIngestService) classifyChunkCitations(
 		out[slug] = ids
 	}
 
-	return out, newSlugsAll, len(batches)
+	return out, newSlugsAll, len(batches), nil
 }
 
 // resolveCitedChunks loads the content of every chunk referenced by the

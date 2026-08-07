@@ -11,6 +11,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/agent"
 	"github.com/Tencent/WeKnora/internal/logger"
 	"github.com/Tencent/WeKnora/internal/models/chat"
+	structuredoutput "github.com/Tencent/WeKnora/internal/structuredoutput"
 	"github.com/Tencent/WeKnora/internal/types"
 )
 
@@ -88,6 +89,23 @@ func (s *wikiIngestService) planBatchTaxonomy(
 		if err != nil {
 			logger.Warnf(ctx, "wiki ingest: taxonomy plan call failed (%d items): %v", len(chunk), err)
 			continue
+		}
+		if structuredoutput.Enabled() {
+			candidates := make([]structuredoutput.Candidate, 0, len(chunk))
+			for _, item := range chunk {
+				candidates = append(candidates, structuredoutput.Candidate{Slug: item.slug, Kind: item.pageType})
+			}
+			accepted, acceptErr := structuredoutput.Accept(ctx, structuredoutput.Request{
+				Contract:   structuredoutput.ContractWikiTaxonomy,
+				Raw:        raw,
+				ModelID:    chatModel.GetModelID(),
+				Candidates: candidates,
+			})
+			if acceptErr != nil {
+				logger.Warnf(ctx, "wiki ingest: taxonomy structured output rejected (%d items): %v", len(chunk), acceptErr)
+				continue
+			}
+			raw = accepted.JSON
 		}
 
 		for slug, path := range parseTaxonomyAssignments(raw) {
