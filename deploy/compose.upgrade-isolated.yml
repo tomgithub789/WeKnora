@@ -1,0 +1,31 @@
+services:
+  frontend:
+    image: wechatopenai/weknora-ui:v0.7.2
+    container_name: WeKnora-frontend
+    ports: !override
+      - "80:80"
+
+  app:
+    image: weknora-app:v0.7.2-local-json
+    container_name: WeKnora-app
+    ports: !override
+      - "8080:8080"
+
+  docreader:
+    image: wechatopenai/weknora-docreader:v0.7.2
+    container_name: WeKnora-docreader
+
+  postgres:
+    container_name: WeKnora-postgres
+
+  redis:
+    container_name: WeKnora-redis
+
+  neo4j:
+    container_name: WeKnora-neo4j
+    ports: !reset []
+
+volumes:
+  data-files:
+    external: true
+    name: weknora-v072_data-files
